@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zero-Trust File Escrow</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config = { darkMode: 'class' };</script>
+<style>
+  body { background:#0b0f16; }
+  .dot { animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:.25} 50%{opacity:1} }
+</style>
+</head>
+<body class="min-h-screen text-slate-200 antialiased">
+
+<div class="mx-auto max-w-3xl px-5 py-10">
+
+  <header class="mb-8">
+    <div class="flex items-center gap-3">
+      <div class="h-9 w-9 rounded-lg bg-emerald-500/15 ring-1 ring-emerald-400/30 grid place-items-center text-emerald-400 text-lg">&#128274;</div>
+      <div>
+        <h1 class="text-xl font-semibold tracking-tight text-white">Zero-Trust File Escrow</h1>
+        <p class="text-xs text-slate-400">Nothing is released until the creator has watched and approved the video.</p>
+      </div>
+    </div>
+  </header>
+
+  <div id="banner" class="hidden mb-5 rounded-lg px-4 py-3 text-sm"></div>
+
+  <main id="view" class="space-y-5"></main>
+
+  <footer class="mt-10 border-t border-white/5 pt-4 text-[11px] text-slate-500">
+    <span id="statusPill"></span>
+  </footer>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const view = document.getElementById('view');
+  const banner = document.getElementById('banner');
+  const statusPill = document.getElementById('statusPill');
+
+  const params = new URLSearchParams(location.search);
+  const exchangeId = params.get('id');
+
+  // ---- owner token handling ---------------------------------------
+  const keyFor = id => `zte:owner:${id}`;
+  if (exchangeId && params.get('owner')) {
+    try { localStorage.setItem(keyFor(exchangeId), params.get('owner')); } catch (_) {}
+    params.delete('owner');
+    history.replaceState(null, '', location.pathname + (params.toString() ? '?' + params : ''));
+  }
+  const ownerToken = () => {
+    if (!exchangeId) return '';
+    try { return localStorage.getItem(keyFor(exchangeId)) || ''; } catch (_) { return ''; }
+  };
+
+  // ---- helpers ----------------------------------------------------
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const bytes = n => {
+    if (!Number.isFinite(n)) return '';
+    const u = ['B','KB','MB','GB']; let i = 0; let v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(v < 10 && i ? 1 : 0)} ${u[i]}`;
+  };
+
+  function say(msg, kind = 'info') {
+    const styles = {
+      info:  'bg-sky-500/10 text-sky-200 ring-1 ring-sky-400/20',
+      ok:    'bg-emerald-500/10 text-emerald-200 ring-1 ring-emerald-400/20',
+      warn:  'bg-amber-500/10 text-amber-200 ring-1 ring-amber-400/20',
+      error: 'bg-rose-500/10 text-rose-200 ring-1 ring-rose-400/20',
+    };
+    banner.className = `mb-5 rounded-lg px-4 py-3 text-sm ${styles[kind]}`;
+    banner.textContent = msg;
+    banner.classList.remove('hidden');
+  }
+  const clearSay = () => banner.classList.add('hidden');
+
+  const card = inner => `<section class="rounded-xl bg-slate-900/70 ring-1 ring-white/10 p-6">${inner}</section>`;
+  const btn = 'inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-medium transition disabled:opacity-40 disabled:cursor-not-allowed';
+  const primary = `${btn} bg-emerald-500 text-slate-950 hover:bg-emerald-400`;
+  const danger  = `${btn} bg-rose-600 text-white hover:bg-rose-500`;
+  const ghost   = `${btn} bg-white/5 text-slate-200 ring-1 ring-white/10 hover:bg-white/10`;
+
+  async function api(path, opts = {}) {
+    const headers = Object.assign({}, opts.headers);
+    const tok = ownerToken();
+    if (tok) headers['x-owner-token'] = tok;
+    const res = await fetch(path, Object.assign({}, opts, { headers }));
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+    return body;
+  }
+
+  /** XHR upload so we get a real progress bar on multi-GB videos. */
+  function upload(url, field, file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const fd = new FormData();
+      fd.append(field, file);
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      const tok = ownerToken();
+      if (tok) xhr.setRequestHeader('x-owner-token', tok);
+      xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+      xhr.onload = () => {
+        let body = {};
+        try { body = JSON.parse(xhr.responseText); } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+        else reject(new Error(body.error || `Upload failed (${xhr.status})`));
+      };
+      xhr.onerror = () => reject(new Error('Network error during upload.'));
+      xhr.send(fd);
+    });
+  }
+
+  function progressUI(label) {
+    return `
+      <div id="prog" class="hidden mt-4">
+        <div class="flex justify-between text-xs text-slate-400 mb-1">
+          <span>${label}</span><span id="progPct">0%</span>
+        </div>
+        <div class="h-1.5 w-full rounded-full bg-white/10 overflow-hidden">
+          <div id="progBar" class="h-full w-0 bg-emerald-400 transition-all duration-150"></div>
+        </div>
+      </div>`;
+  }
+  function setProgress(f) {
+    const box = document.getElementById('prog');
+    if (!box) return;
+    box.classList.remove('hidden');
+    document.getElementById('progBar').style.width = `${Math.round(f * 100)}%`;
+    document.getElementById('progPct').textContent = `${Math.round(f * 100)}%`;
+  }
+
+  // ==================================================================
+  // Screen 1 — creator, no exchange yet
+  // ==================================================================
+  function renderCreate() {
+    statusPill.textContent = 'Step 1 of 3 — lock a file';
+    view.innerHTML = card(`
+      <h2 class="text-base font-semibold text-white">Lock your HTML file</h2>
+      <p class="mt-1 text-sm text-slate-400">
+        Your file is held server-side. The other party cannot download it until they send a video
+        <em>and</em> you have watched it and pressed Approve.
+      </p>
+      <label class="mt-5 block cursor-pointer rounded-lg border border-dashed border-white/15 bg-white/[0.02] px-4 py-8 text-center hover:border-emerald-400/40 hover:bg-emerald-400/[0.03]">
+        <input id="htmlInput" type="file" accept=".html,.htm,text/html" class="hidden">
+        <div class="text-sm text-slate-300"><span class="text-emerald-400 font-medium">Choose a file</span> or drop it here</div>
+        <div id="htmlName" class="mt-1 text-xs text-slate-500">.html or .htm</div>
+      </label>
+      ${progressUI('Uploading')}
+      <button id="lockBtn" class="${primary} mt-5 w-full" disabled>Lock HTML &amp; Create Link</button>
+    `);
+
+    const input = document.getElementById('htmlInput');
+    const nameEl = document.getElementById('htmlName');
+    const lockBtn = document.getElementById('lockBtn');
+    const drop = input.closest('label');
+
+    const pick = file => {
+      if (!file) return;
+      input.files = null;
+      nameEl.textContent = `${file.name} — ${bytes(file.size)}`;
+      lockBtn.disabled = false;
+      lockBtn.dataset.ready = '1';
+      drop._file = file;
+    };
+
+    input.addEventListener('change', () => pick(input.files[0]));
+    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('border-emerald-400/60'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('border-emerald-400/60'));
+    drop.addEventListener('drop', e => {
+      e.preventDefault();
+      drop.classList.remove('border-emerald-400/60');
+      pick(e.dataTransfer.files[0]);
+    });
+
+    lockBtn.addEventListener('click', async () => {
+      const file = drop._file;
+      if (!file) return;
+      clearSay();
+      lockBtn.disabled = true;
+      lockBtn.textContent = 'Locking…';
+      try {
+        const out = await upload('/api/create', 'htmlFile', file, setProgress);
+        try { localStorage.setItem(keyFor(out.exchangeId), out.ownerToken); } catch (_) {}
+        location.search = `?id=${out.exchangeId}`;
+      } catch (err) {
+        say(err.message, 'error');
+        lockBtn.disabled = false;
+        lockBtn.textContent = 'Lock HTML & Create Link';
+      }
+    });
+  }
+
+  // ==================================================================
+  // Screen 2 — creator dashboard
+  // ==================================================================
+  let mountedVideoRev = null;
+  let decodeWatchdog = null;
+
+  function renderCreator(s) {
+    const shareUrl = `${location.origin}/?id=${s.exchangeId}`;
+
+    if (s.status === 'waiting_for_b') {
+      statusPill.textContent = 'Step 2 of 3 — waiting for their video';
+      view.innerHTML = card(`
+        <div class="flex items-center gap-2 text-xs font-medium text-amber-300">
+          <span class="dot h-2 w-2 rounded-full bg-amber-400"></span> Waiting for the other party
+        </div>
+        <h2 class="mt-3 text-base font-semibold text-white">Your link is live</h2>
+        <p class="mt-1 text-sm text-slate-400">Send this to them. It reveals nothing about your file until you approve.</p>
+        <div class="mt-4 flex gap-2">
+          <input id="shareUrl" readonly value="${esc(shareUrl)}"
+                 class="flex-1 rounded-lg bg-slate-950 px-3 py-2.5 text-sm text-slate-300 ring-1 ring-white/10 font-mono">
+          <button id="copyBtn" class="${ghost}">Copy</button>
+        </div>
+        <dl class="mt-5 grid grid-cols-2 gap-3 text-sm">
+          <div class="rounded-lg bg-white/[0.03] px-3 py-2">
+            <dt class="text-xs text-slate-500">Locked file</dt>
+            <dd class="truncate text-slate-200">${esc(s.html ? s.html.name : '—')}</dd>
+          </div>
+          <div class="rounded-lg bg-white/[0.03] px-3 py-2">
+            <dt class="text-xs text-slate-500">Their video</dt>
+            <dd class="text-slate-500">Not received</dd>
+          </div>
+        </dl>
+        <p class="mt-4 text-xs text-slate-500">This page refreshes itself the moment their video lands.</p>
+      `);
+      const copy = document.getElementById('copyBtn');
+      copy.addEventListener('click', async () => {
+        const field = document.getElementById('shareUrl');
+        try { await navigator.clipboard.writeText(field.value); }
+        catch (_) { field.select(); document.execCommand('copy'); }
+        copy.textContent = 'Copied';
+        setTimeout(() => (copy.textContent = 'Copy'), 1500);
+      });
+      return;
+    }
+
+    if (s.status === 'pending_approval') {
+      statusPill.textContent = 'Step 3 of 3 — verify before releasing';
+      const v = s.video || {};
+      const src = `/api/preview-video/${s.exchangeId}?owner=${encodeURIComponent(ownerToken())}&rev=${s.rev}`;
+      const player = s.inlinePlayable
+        ? `<video id="player" class="mt-4 w-full rounded-lg bg-black ring-1 ring-white/10" controls preload="metadata" playsinline></video>
+           <p id="playFail" class="hidden mt-2 text-xs text-amber-300">
+             Your browser can’t play this file (codec or container). Download it below and verify it in VLC before approving.
+           </p>`
+        : `<div class="mt-4 rounded-lg bg-amber-500/10 ring-1 ring-amber-400/20 px-4 py-3 text-sm text-amber-200">
+             <strong>${esc(v.ext || 'This format')}</strong> usually won’t play in a browser.
+             Download the raw stream below and verify it in VLC before approving.
+           </div>`;
+
+      view.innerHTML = card(`
+        <div class="flex items-center gap-2 text-xs font-medium text-sky-300">
+          <span class="dot h-2 w-2 rounded-full bg-sky-400"></span> Awaiting your verdict — both files are still locked
+        </div>
+        <h2 class="mt-3 text-base font-semibold text-white">Verify their video</h2>
+        <p class="mt-1 text-sm text-slate-400">
+          ${esc(v.name || 'video')} · ${bytes(v.size)} · streamed directly from the server, never released to them.
+        </p>
+        ${player}
+        <div class="mt-3">
+          <a class="${ghost}" href="/api/preview-video/${s.exchangeId}?download=1&owner=${encodeURIComponent(ownerToken())}">
+            &#11015; Download raw file to check in VLC
+          </a>
+        </div>
+        <div class="mt-6 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button id="approveBtn" class="${primary}">&#10003; Approve &amp; Swap</button>
+          <button id="rejectBtn" class="${danger}">&#10005; Reject &amp; Destroy</button>
+        </div>
+        <p class="mt-3 text-xs text-slate-500">
+          Approve unlocks your HTML for them and their video for you. Reject permanently deletes both files from the server.
+        </p>
+      `);
+
+      if (s.inlinePlayable && mountedVideoRev !== s.rev) {
+        const player = document.getElementById('player');
+        const warn = document.getElementById('playFail');
+        const flagUnplayable = () => warn.classList.remove('hidden');
+
+        // Chrome does not reliably fire `error` on a stream it cannot decode —
+        // it can sit in networkState=LOADING with readyState=0 indefinitely.
+        // So also treat "no metadata after 6s" as unplayable, rather than
+        // leaving A staring at a spinner with no way forward.
+        //
+        // But Chrome ALSO defers media loading entirely while a tab is in the
+        // background, which looks identical. Only judge a file once the tab
+        // has actually been on screen, or we cry wolf on a perfectly good video.
+        const armWatchdog = () => {
+          clearTimeout(decodeWatchdog);
+          decodeWatchdog = setTimeout(() => {
+            if (player.readyState >= 1) return;
+            if (document.hidden) return armWatchdog();
+            flagUnplayable();
+          }, 6000);
+        };
+        armWatchdog();
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden && player.readyState < 1) armWatchdog();
+        });
+        player.addEventListener('error', flagUnplayable);
+        player.addEventListener('loadedmetadata', () => {
+          clearTimeout(decodeWatchdog);
+          warn.classList.add('hidden');
+        });
+
+        player.src = src;
+        mountedVideoRev = s.rev;
+      }
+
+      document.getElementById('approveBtn').addEventListener('click', async e => {
+        e.target.disabled = true;
+        try { await api(`/api/approve/${s.exchangeId}`, { method: 'POST' }); poll(true); }
+        catch (err) { say(err.message, 'error'); e.target.disabled = false; }
+      });
+      document.getElementById('rejectBtn').addEventListener('click', async e => {
+        if (!confirmInline()) return;
+        e.target.disabled = true;
+        try { await api(`/api/reject/${s.exchangeId}`, { method: 'POST' }); poll(true); }
+        catch (err) { say(err.message, 'error'); e.target.disabled = false; }
+      });
+      return;
+    }
+
+    if (s.status === 'released') {
+      statusPill.textContent = 'Complete — swap released';
+      mountedVideoRev = null;
+      view.innerHTML = card(`
+        <div class="flex items-center gap-2 text-xs font-medium text-emerald-300">
+          <span class="h-2 w-2 rounded-full bg-emerald-400"></span> Swap released
+        </div>
+        <h2 class="mt-3 text-base font-semibold text-white">Done. Your copy is ready.</h2>
+        <p class="mt-1 text-sm text-slate-400">They can now download <span class="text-slate-200">${esc(s.html ? s.html.name : 'your file')}</span>.</p>
+        <a class="${primary} mt-5 w-full" href="/api/download-video/${s.exchangeId}?owner=${encodeURIComponent(ownerToken())}">
+          &#11015; Download ${esc(s.video ? s.video.name : 'their video')} (${bytes(s.video ? s.video.size : 0)})
+        </a>
+        <p class="mt-3 text-xs text-slate-500">Both files are removed from the server automatically once the exchange expires.</p>
+      `);
+      return;
+    }
+
+    // empty — rejected, or re-armable
+    statusPill.textContent = 'Exchange empty';
+    const rejected = s.lastDecision && s.lastDecision.action === 'rejected';
+    view.innerHTML = card(`
+      <div class="flex items-center gap-2 text-xs font-medium text-rose-300">
+        <span class="h-2 w-2 rounded-full bg-rose-400"></span> ${rejected ? 'Rejected — both files destroyed' : 'Nothing locked'}
+      </div>
+      <h2 class="mt-3 text-base font-semibold text-white">Lock a new file on the same link</h2>
+      <p class="mt-1 text-sm text-slate-400">The share link stays valid, so you don’t have to re-send it.</p>
+      <label class="mt-5 block cursor-pointer rounded-lg border border-dashed border-white/15 bg-white/[0.02] px-4 py-6 text-center hover:border-emerald-400/40">
+        <input id="htmlInput" type="file" accept=".html,.htm,text/html" class="hidden">
+        <div class="text-sm text-slate-300"><span class="text-emerald-400 font-medium">Choose a file</span></div>
+        <div id="htmlName" class="mt-1 text-xs text-slate-500">.html or .htm</div>
+      </label>
+      ${progressUI('Uploading')}
+      <button id="relockBtn" class="${primary} mt-5 w-full" disabled>Re-lock HTML</button>
+    `);
+    const input = document.getElementById('htmlInput');
+    const relock = document.getElementById('relockBtn');
+    input.addEventListener('change', () => {
+      const f = input.files[0];
+      if (!f) return;
+      document.getElementById('htmlName').textContent = `${f.name} — ${bytes(f.size)}`;
+      relock.disabled = false;
+    });
+    relock.addEventListener('click', async () => {
+      relock.disabled = true;
+      relock.textContent = 'Uploading…';
+      try {
+        await upload(`/api/relock/${s.exchangeId}`, 'htmlFile', input.files[0], setProgress);
+        poll(true);
+      } catch (err) { say(err.message, 'error'); relock.disabled = false; relock.textContent = 'Re-lock HTML'; }
+    });
+  }
+
+  function confirmInline() {
+    return window.confirm('Reject and permanently delete BOTH files from the server? This cannot be undone.');
+  }
+
+  // ==================================================================
+  // Screen 3 — guest (User B)
+  // ==================================================================
+  function renderGuest(s) {
+    if (s.status === 'waiting_for_b') {
+      statusPill.textContent = 'Your move — upload a video';
+      view.innerHTML = card(`
+        <div class="flex items-center gap-2 text-xs font-medium text-emerald-300">
+          <span class="h-2 w-2 rounded-full bg-emerald-400"></span> A file has been locked for you
+        </div>
+        <h2 class="mt-3 text-base font-semibold text-white">Upload your video to unlock it</h2>
+        <p class="mt-1 text-sm text-slate-400">
+          They have locked <span class="text-slate-200">${esc(s.html ? s.html.name : 'an HTML file')}</span>
+          (${bytes(s.html ? s.html.size : 0)}). It is released to you once they have watched your video and approved it.
+        </p>
+        <label class="mt-5 block cursor-pointer rounded-lg border border-dashed border-white/15 bg-white/[0.02] px-4 py-8 text-center hover:border-emerald-400/40 hover:bg-emerald-400/[0.03]">
+          <input id="vidInput" type="file" accept="video/*,.mp4,.mov,.mkv,.avi,.webm" class="hidden">
+          <div class="text-sm text-slate-300"><span class="text-emerald-400 font-medium">Choose a video</span> or drop it here</div>
+          <div id="vidName" class="mt-1 text-xs text-slate-500">MP4, MOV, MKV, AVI or WebM</div>
+        </label>
+        ${progressUI('Uploading video')}
+        <button id="sendBtn" class="${primary} mt-5 w-full" disabled>Send Video</button>
+      `);
+
+      const input = document.getElementById('vidInput');
+      const nameEl = document.getElementById('vidName');
+      const sendBtn = document.getElementById('sendBtn');
+      const drop = input.closest('label');
+
+      const pick = f => {
+        if (!f) return;
+        drop._file = f;
+        nameEl.textContent = `${f.name} — ${bytes(f.size)}`;
+        sendBtn.disabled = false;
+      };
+      input.addEventListener('change', () => pick(input.files[0]));
+      drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('border-emerald-400/60'); });
+      drop.addEventListener('dragleave', () => drop.classList.remove('border-emerald-400/60'));
+      drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('border-emerald-400/60'); pick(e.dataTransfer.files[0]); });
+
+      sendBtn.addEventListener('click', async () => {
+        if (!drop._file) return;
+        clearSay();
+        sendBtn.disabled = true;
+        sendBtn.textContent = 'Uploading…';
+        try {
+          await upload(`/api/upload-video/${s.exchangeId}`, 'videoFile', drop._file, setProgress);
+          poll(true);
+        } catch (err) {
+          say(err.message, 'error');
+          sendBtn.disabled = false;
+          sendBtn.textContent = 'Send Video';
+        }
+      });
+      return;
+    }
+
+    if (s.status === 'pending_approval') {
+      statusPill.textContent = 'Held in escrow';
+      view.innerHTML = card(`
+        <div class="flex flex-col items-center py-6 text-center">
+          <div class="flex gap-1.5">
+            <span class="dot h-2.5 w-2.5 rounded-full bg-sky-400" style="animation-delay:0s"></span>
+            <span class="dot h-2.5 w-2.5 rounded-full bg-sky-400" style="animation-delay:.2s"></span>
+            <span class="dot h-2.5 w-2.5 rounded-full bg-sky-400" style="animation-delay:.4s"></span>
+          </div>
+          <h2 class="mt-5 text-base font-semibold text-white">Waiting for approval</h2>
+          <p class="mt-2 max-w-sm text-sm text-slate-400">
+            Your video was delivered. They are reviewing it now. The HTML file unlocks here automatically
+            the moment they approve — keep this tab open.
+          </p>
+        </div>
+      `);
+      return;
+    }
+
+    if (s.status === 'released') {
+      statusPill.textContent = 'Released';
+      view.innerHTML = card(`
+        <div class="flex items-center gap-2 text-xs font-medium text-emerald-300">
+          <span class="h-2 w-2 rounded-full bg-emerald-400"></span> Approved
+        </div>
+        <h2 class="mt-3 text-base font-semibold text-white">Your file is unlocked</h2>
+        <p class="mt-1 text-sm text-slate-400">They verified your video and released the swap.</p>
+        <a class="${primary} mt-5 w-full" href="/api/download-html/${s.exchangeId}">
+          &#11015; Download ${esc(s.html ? s.html.name : 'file')} (${bytes(s.html ? s.html.size : 0)})
+        </a>
+      `);
+      return;
+    }
+
+    statusPill.textContent = 'Exchange empty';
+    view.innerHTML = card(`
+      <div class="flex items-center gap-2 text-xs font-medium text-rose-300">
+        <span class="h-2 w-2 rounded-full bg-rose-400"></span> Nothing available
+      </div>
+      <h2 class="mt-3 text-base font-semibold text-white">This exchange is empty</h2>
+      <p class="mt-1 text-sm text-slate-400">
+        The video was rejected and both files were destroyed, or nothing has been locked yet.
+        Check back if they re-lock a file on this link.
+      </p>
+    `);
+  }
+
+  // ==================================================================
+  // Polling loop
+  // ==================================================================
+  let lastRev = -1;
+  let lastRole = null;
+  let timer = null;
+
+  async function poll(force = false) {
+    try {
+      const s = await api(`/api/status/${exchangeId}`);
+      clearSay();
+      if (force || s.rev !== lastRev || s.role !== lastRole) {
+        lastRev = s.rev;
+        lastRole = s.role;
+        if (s.role === 'creator') renderCreator(s); else renderGuest(s);
+      }
+    } catch (err) {
+      say(err.message, 'error');
+      if (/No such exchange/i.test(err.message)) {
+        clearInterval(timer);
+        view.innerHTML = card(`
+          <h2 class="text-base font-semibold text-white">Link not found</h2>
+          <p class="mt-1 text-sm text-slate-400">This exchange does not exist, or it expired and was cleaned up.</p>
+          <a class="${ghost} mt-4" href="/">Start a new exchange</a>
+        `);
+      }
+    }
+  }
+
+  if (!exchangeId) {
+    renderCreate();
+  } else {
+    poll(true);
+    timer = setInterval(poll, 2500);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+  }
+})();
+</script>
+</body>
+</html>

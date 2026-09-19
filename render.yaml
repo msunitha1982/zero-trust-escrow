@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: zero-trust-file-escrow
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: MAX_VIDEO_MB
+        value: "2048"
+      - key: MAX_HTML_MB
+        value: "10"
+      - key: EXCHANGE_TTL_HOURS
+        value: "24"
